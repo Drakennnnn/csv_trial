@@ -176,11 +176,11 @@ class ExcelToCSVProcessor:
                 # Add/update lot and get lot_id
                 lot_id = self.add_lot(lot_number, lot_weight)
                 
-                # Create processing record with the actual lot_id (not NULL!)
+                # Create processing record - lot_id will be filled later from lots data
                 processing_record = {
                     'record_id': str(uuid.uuid4()),
-                    'lot_id': lot_id,  # This is now populated with actual UUID
-                    'lot_number': lot_number,  # Keep lot_number for verification
+                    'lot_id': None,  # Will be filled from lots data during CSV generation
+                    'lot_number': lot_number,  # Keep lot_number for matching
                     'stage': stage,
                     'process_date': process_date,
                     'given_pieces': given_pieces,
@@ -279,7 +279,7 @@ class ExcelToCSVProcessor:
         """Generate CSV files for download"""
         csv_files = {}
         
-        # Generate lots CSV
+        # Step 1: Generate lots CSV FIRST
         if self.results['lots_data']:
             lots_df = pd.DataFrame(self.results['lots_data'])
             # Ensure proper data types for lots
@@ -288,9 +288,18 @@ class ExcelToCSVProcessor:
             lots_df = lots_df.sort_values('lot_number')
             csv_files['lots.csv'] = lots_df.to_csv(index=False, float_format='%.4f')
         
-        # Generate processing records CSV (with actual lot_id values!)
+        # Step 2: Generate processing records CSV using lot_ids from lots data
         if self.results['processing_records_data']:
             processing_df = pd.DataFrame(self.results['processing_records_data'])
+            
+            # CRITICAL: Match lot_number and fill lot_id from lots data
+            for idx, row in processing_df.iterrows():
+                lot_number = row['lot_number']
+                # Find matching lot_id from lots_dict
+                if lot_number in self.lots_dict:
+                    processing_df.at[idx, 'lot_id'] = self.lots_dict[lot_number]['lot_id']
+                else:
+                    st.error(f"ERROR: Could not find lot_id for lot_number: {lot_number}")
             
             # Ensure proper data types for processing records
             processing_df['given_weight'] = processing_df['given_weight'].astype(float)
@@ -304,7 +313,7 @@ class ExcelToCSVProcessor:
                 lambda x: '' if pd.isna(x) or x is None else int(x)
             )
             
-            # Column order for processing records (lot_id is now populated!)
+            # Column order for processing records (lot_id is now matched from lots!)
             column_order = ['record_id', 'lot_id', 'lot_number', 'stage', 'process_date', 
                           'given_pieces', 'given_weight', 'received_pieces', 'received_weight']
             processing_df = processing_df[column_order]
@@ -377,7 +386,7 @@ def main():
                 
                 **Step 1:** Import `lots.csv` into Supabase  
                 **Step 2:** Import `processing_records.csv` into Supabase  
-                **That's it!** - lot_id values are automatically populated and lot_number is included for verification!
+                **That's it!** - lot_id values are matched from lots data based on lot_number!
                 """)
                 
                 st.markdown("Download the generated CSV files:")
@@ -476,11 +485,11 @@ def main():
         4. Settings: ✅ First row contains headers, ✅ Auto-detect data types
         
         ## ✅ What's Included Now
-        - ✅ **lot_id is automatically populated** in processing_records.csv
-        - ✅ **lot_number is included** for easy verification
-        - ✅ **No manual SQL queries needed**
+        - ✅ **lots.csv generated first** with unique lot_id for each lot_number
+        - ✅ **processing_records.csv uses exact same lot_id** by matching lot_number
+        - ✅ **lot_number included** for easy verification
+        - ✅ **No random lot_id generation** - consistent matching
         - ✅ **Direct import ready** - no foreign key errors
-        - ✅ **Automatic lot matching** based on lot_number
         
         ## 🔍 Verification After Import
         ```sql
