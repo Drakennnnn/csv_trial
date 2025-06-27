@@ -27,7 +27,8 @@ class ExcelToCSVProcessor:
             'lots_data': [],
             'processing_records_data': [],
             'sheets_processed': [],
-            'errors': []
+            'errors': [],
+            'validation_issues': []
         }
         
         # Track unique lots to avoid duplicates
@@ -195,6 +196,35 @@ class ExcelToCSVProcessor:
         
         self.results['sheets_processed'].append(stage)
 
+    def validate_data_integrity(self):
+        """Validate that all processing records have corresponding lots"""
+        st.info("🔍 Validating data integrity...")
+        
+        # Get all lot_ids from lots
+        lot_ids_in_lots = set(lot['lot_id'] for lot in self.results['lots_data'])
+        
+        # Get all lot_ids from processing records
+        lot_ids_in_processing = set(record['lot_id'] for record in self.results['processing_records_data'])
+        
+        # Find orphaned processing records
+        orphaned_lot_ids = lot_ids_in_processing - lot_ids_in_lots
+        
+        if orphaned_lot_ids:
+            self.results['validation_issues'].append(
+                f"Found {len(orphaned_lot_ids)} processing records with lot_ids not in lots table: {list(orphaned_lot_ids)[:5]}..."
+            )
+            return False
+        
+        # Find unused lots
+        unused_lot_ids = lot_ids_in_lots - lot_ids_in_processing
+        if unused_lot_ids:
+            self.results['validation_issues'].append(
+                f"Found {len(unused_lot_ids)} lots with no processing records"
+            )
+        
+        st.success("✅ Data integrity validation passed!")
+        return True
+
     def process_excel_file(self, uploaded_file):
         """Main method to process the entire Excel file"""
         st.info("Starting Excel processing...")
@@ -224,6 +254,11 @@ class ExcelToCSVProcessor:
                 else:
                     st.warning(f"Sheet '{sheet_name}' not found in Excel file")
             
+            # Validate data integrity
+            if not self.validate_data_integrity():
+                st.error("❌ Data integrity validation failed! Check validation issues below.")
+                return False
+            
             st.success("Processing completed successfully!")
             return True
             
@@ -242,7 +277,8 @@ class ExcelToCSVProcessor:
             lots_df = pd.DataFrame(self.results['lots_data'])
             # Ensure proper data types for lots
             lots_df['lot_weight'] = lots_df['lot_weight'].astype(float)
-            # Format to avoid .0 issues
+            # Sort by lot_number for easier reference
+            lots_df = lots_df.sort_values('lot_number')
             csv_files['lots.csv'] = lots_df.to_csv(index=False, float_format='%.4f')
         
         # Generate processing records CSV
@@ -261,6 +297,8 @@ class ExcelToCSVProcessor:
                 lambda x: '' if pd.isna(x) or x is None else int(x)
             )
             
+            # Sort by process_date and stage for better organization
+            processing_df = processing_df.sort_values(['process_date', 'stage'])
             csv_files['processing_records.csv'] = processing_df.to_csv(index=False, float_format='%.4f')
             
             # Also generate separate CSV for each stage
@@ -301,6 +339,13 @@ def main():
             with col3:
                 st.metric("Sheets Processed", len(processor.results['sheets_processed']))
             
+            # Show validation issues if any
+            if processor.results['validation_issues']:
+                st.warning(f"⚠️ {len(processor.results['validation_issues'])} validation issues found:")
+                with st.expander("View Validation Issues"):
+                    for issue in processor.results['validation_issues']:
+                        st.text(f"• {issue}")
+            
             # Show errors if any
             if processor.results['errors']:
                 st.warning(f"⚠️ {len(processor.results['errors'])} errors encountered:")
@@ -313,6 +358,17 @@ def main():
             
             if csv_files:
                 st.header("📥 Download CSV Files")
+                
+                # Add prominent import order warning
+                st.error("""
+                🚨 **CRITICAL: Import Order Matters!**
+                
+                **Step 1:** Download and import `lots.csv` FIRST into Supabase
+                **Step 2:** Only then import `processing_records.csv` 
+                
+                Importing in wrong order will cause foreign key constraint errors!
+                """)
+                
                 st.markdown("Download the generated CSV files to import into Supabase:")
                 
                 # Create download buttons for individual files
@@ -321,21 +377,13 @@ def main():
                 with col1:
                     if 'lots.csv' in csv_files:
                         st.download_button(
-                            label="📋 Download Lots CSV",
+                            label="🥇 Step 1: Download Lots CSV (Import FIRST)",
                             data=csv_files['lots.csv'],
                             file_name='lots.csv',
-                            mime='text/csv'
+                            mime='text/csv',
+                            type="primary"
                         )
                     
-                    if 'processing_records.csv' in csv_files:
-                        st.download_button(
-                            label="⚙️ Download All Processing Records CSV",
-                            data=csv_files['processing_records.csv'],
-                            file_name='processing_records.csv',
-                            mime='text/csv'
-                        )
-                
-                with col2:
                     # Individual stage files
                     for stage in processor.results['sheets_processed']:
                         filename = f'{stage.lower()}_records.csv'
@@ -346,6 +394,16 @@ def main():
                                 file_name=filename,
                                 mime='text/csv'
                             )
+                
+                with col2:
+                    if 'processing_records.csv' in csv_files:
+                        st.download_button(
+                            label="🥈 Step 2: Download All Processing Records CSV (Import SECOND)",
+                            data=csv_files['processing_records.csv'],
+                            file_name='processing_records.csv',
+                            mime='text/csv',
+                            type="secondary"
+                        )
                 
                 # Create zip file with all CSVs
                 zip_buffer = io.BytesIO()
@@ -371,6 +429,7 @@ def main():
                     if processor.results['lots_data']:
                         lots_df = pd.DataFrame(processor.results['lots_data'])
                         st.dataframe(lots_df, use_container_width=True)
+                        st.info(f"Total unique lots: {len(lots_df)}")
                     else:
                         st.info("No lots data generated")
                 
@@ -378,24 +437,51 @@ def main():
                     if processor.results['processing_records_data']:
                         processing_df = pd.DataFrame(processor.results['processing_records_data'])
                         st.dataframe(processing_df, use_container_width=True)
+                        st.info(f"Total processing records: {len(processing_df)}")
+                        
+                        # Show breakdown by stage
+                        stage_counts = processing_df['stage'].value_counts()
+                        st.subheader("Records by Stage:")
+                        for stage, count in stage_counts.items():
+                            st.text(f"• {stage}: {count} records")
                     else:
                         st.info("No processing records data generated")
         
-        # Instructions for Supabase import
+        # Enhanced instructions for Supabase import
         st.header("📚 Supabase Import Instructions")
         st.markdown("""
-        **To import the CSV files into Supabase:**
+        ## 🚨 Critical Import Steps (Follow Exactly!)
         
-        1. **Import `lots.csv` first** into the `lots` table
-        2. **Then import `processing_records.csv`** into the `processing_records` table
-        3. **Alternative**: Import individual stage CSV files if you prefer
+        ### Step 1: Import Lots Table FIRST
+        1. Go to Supabase → Table Editor → `lots` table
+        2. Click "Insert" → "Import data from CSV"
+        3. Upload `lots.csv`
+        4. Settings: ✅ First row contains headers, ✅ Auto-detect data types
+        5. **Wait for completion** before proceeding
         
-        **Import Settings:**
-        - ✅ First row contains headers
-        - ✅ Auto-detect data types
-        - ✅ Replace existing data (if re-importing)
+        ### Step 2: Import Processing Records SECOND
+        1. Go to Supabase → Table Editor → `processing_records` table
+        2. Click "Insert" → "Import data from CSV"  
+        3. Upload `processing_records.csv`
+        4. Settings: ✅ First row contains headers, ✅ Auto-detect data types
         
-        **Note**: The `lot_id` in processing_records will reference the `lot_id` from the lots table.
+        ## ⚠️ Troubleshooting Foreign Key Errors
+        
+        **If you get the foreign key constraint error:**
+        1. **Clear both tables** in Supabase (Delete all rows)
+        2. **Re-download** the CSV files from this tool
+        3. **Import lots.csv FIRST**, wait for completion
+        4. **Then import processing_records.csv**
+        
+        **Alternative Approach:**
+        - Import individual stage CSV files instead of the combined processing_records.csv
+        - This can help isolate any problematic records
+        
+        ## 📋 Data Validation Checks
+        - ✅ All processing records have valid lot_id references
+        - ✅ No orphaned records
+        - ✅ Data types are properly formatted
+        - ✅ Dates are in YYYY-MM-DD format
         """)
 
 if __name__ == "__main__":
