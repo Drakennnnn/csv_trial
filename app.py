@@ -31,7 +31,7 @@ class ExcelToCSVProcessor:
             'validation_issues': []
         }
         
-        # Track unique lots to avoid duplicates
+        # Track unique lots to avoid duplicates - lot_number -> lot_id mapping
         self.lots_dict = {}
 
     def normalize_date(self, date_value):
@@ -109,7 +109,7 @@ class ExcelToCSVProcessor:
             return default
 
     def add_lot(self, lot_number, lot_weight):
-        """Add lot to lots dictionary if not exists"""
+        """Add lot to lots dictionary if not exists and return lot_id"""
         if lot_number not in self.lots_dict:
             lot_id = str(uuid.uuid4())
             self.lots_dict[lot_number] = {
@@ -131,6 +131,12 @@ class ExcelToCSVProcessor:
                         lot['lot_weight'] = float(lot_weight)
                         break
             return existing_lot['lot_id']
+
+    def get_lot_id_by_lot_number(self, lot_number):
+        """Get lot_id from existing lots dictionary"""
+        if lot_number in self.lots_dict:
+            return self.lots_dict[lot_number]['lot_id']
+        return None
 
     def process_sheet(self, df, stage):
         """Process individual sheet data"""
@@ -167,15 +173,13 @@ class ExcelToCSVProcessor:
                     received_pieces = self.normalize_integer(row.iloc[5] if len(row) > 5 else None)  # REC.P
                     received_weight = self.normalize_numeric(row.iloc[6] if len(row) > 6 else 0, 0)  # REC.W
                 
-                # Add lot and get lot_id (for internal tracking)
+                # Add/update lot and get lot_id
                 lot_id = self.add_lot(lot_number, lot_weight)
                 
-                # Create processing record with BOTH lot_number and lot_id
-                # lot_id will be NULL initially, lot_number will be used for matching
+                # Create processing record with the actual lot_id (not NULL!)
                 processing_record = {
                     'record_id': str(uuid.uuid4()),
-                    'lot_id': None,  # Will be updated via SQL after import
-                    'lot_number': lot_number,  # Include lot_number for SQL matching
+                    'lot_id': lot_id,  # This is now populated with actual UUID
                     'stage': stage,
                     'process_date': process_date,
                     'given_pieces': given_pieces,
@@ -202,26 +206,26 @@ class ExcelToCSVProcessor:
         """Validate that all processing records have corresponding lots"""
         st.info("🔍 Validating data integrity...")
         
-        # Get all lot_numbers from lots
-        lot_numbers_in_lots = set(lot['lot_number'] for lot in self.results['lots_data'])
+        # Get all lot_ids from lots
+        lot_ids_in_lots = set(lot['lot_id'] for lot in self.results['lots_data'])
         
-        # Get all lot_numbers from processing records
-        lot_numbers_in_processing = set(record['lot_number'] for record in self.results['processing_records_data'])
+        # Get all lot_ids from processing records
+        lot_ids_in_processing = set(record['lot_id'] for record in self.results['processing_records_data'])
         
         # Find orphaned processing records
-        orphaned_lot_numbers = lot_numbers_in_processing - lot_numbers_in_lots
+        orphaned_lot_ids = lot_ids_in_processing - lot_ids_in_lots
         
-        if orphaned_lot_numbers:
+        if orphaned_lot_ids:
             self.results['validation_issues'].append(
-                f"Found {len(orphaned_lot_numbers)} processing records with lot_numbers not in lots table: {list(orphaned_lot_numbers)[:5]}..."
+                f"Found {len(orphaned_lot_ids)} processing records with lot_ids not in lots table"
             )
             return False
         
         # Find unused lots
-        unused_lot_numbers = lot_numbers_in_lots - lot_numbers_in_processing
-        if unused_lot_numbers:
+        unused_lot_ids = lot_ids_in_lots - lot_ids_in_processing
+        if unused_lot_ids:
             self.results['validation_issues'].append(
-                f"Found {len(unused_lot_numbers)} lots with no processing records"
+                f"Found {len(unused_lot_ids)} lots with no processing records"
             )
         
         st.success("✅ Data integrity validation passed!")
@@ -283,7 +287,7 @@ class ExcelToCSVProcessor:
             lots_df = lots_df.sort_values('lot_number')
             csv_files['lots.csv'] = lots_df.to_csv(index=False, float_format='%.4f')
         
-        # Generate processing records CSV (with lot_number column for SQL matching)
+        # Generate processing records CSV (with actual lot_id values!)
         if self.results['processing_records_data']:
             processing_df = pd.DataFrame(self.results['processing_records_data'])
             
@@ -299,11 +303,8 @@ class ExcelToCSVProcessor:
                 lambda x: '' if pd.isna(x) or x is None else int(x)
             )
             
-            # Set lot_id to empty string for CSV (will be filled by SQL)
-            processing_df['lot_id'] = ''
-            
-            # Reorder columns to put lot_number after lot_id for clarity
-            column_order = ['record_id', 'lot_id', 'lot_number', 'stage', 'process_date', 
+            # Column order for processing records (lot_id is now populated!)
+            column_order = ['record_id', 'lot_id', 'stage', 'process_date', 
                           'given_pieces', 'given_weight', 'received_pieces', 'received_weight']
             processing_df = processing_df[column_order]
             
@@ -320,7 +321,7 @@ class ExcelToCSVProcessor:
 
 def main():
     st.title("💎 Emerald Inventory - Excel to CSV Converter")
-    st.markdown("Upload your Excel file to convert it into CSV files for Supabase import")
+    st.markdown("Upload your Excel file to convert it into CSV files for direct Supabase import")
     
     # File uploader
     uploaded_file = st.file_uploader(
@@ -371,11 +372,11 @@ def main():
                 
                 # Updated import instructions
                 st.success("""
-                ✅ **NEW APPROACH: No Foreign Key Errors!**
+                ✅ **READY FOR DIRECT IMPORT!**
                 
                 **Step 1:** Import `lots.csv` into Supabase  
                 **Step 2:** Import `processing_records.csv` into Supabase  
-                **Step 3:** Run the SQL update query (provided below)
+                **That's it!** - lot_id values are automatically populated!
                 """)
                 
                 st.markdown("Download the generated CSV files:")
@@ -456,34 +457,10 @@ def main():
                     else:
                         st.info("No processing records data generated")
         
-        # SQL Update Instructions
-        st.header("🛠️ SQL Update Query")
+        # Enhanced instructions 
+        st.header("📚 Simple Import Instructions")
         st.markdown("""
-        **After importing both CSV files to Supabase, run this SQL query in the SQL Editor:**
-        """)
-        
-        sql_query = """-- Update lot_id in processing_records table based on lot_number
-UPDATE processing_records 
-SET lot_id = lots.lot_id 
-FROM lots 
-WHERE processing_records.lot_number = lots.lot_number;
-
--- Verify the update worked
-SELECT 
-    COUNT(*) as total_records,
-    COUNT(lot_id) as records_with_lot_id,
-    COUNT(*) - COUNT(lot_id) as records_without_lot_id
-FROM processing_records;
-
--- Optional: Remove lot_number column after successful update
--- ALTER TABLE processing_records DROP COLUMN lot_number;"""
-        
-        st.code(sql_query, language='sql')
-        
-        # Enhanced instructions
-        st.header("📚 Complete Import Instructions")
-        st.markdown("""
-        ## 🚀 Step-by-Step Process
+        ## 🚀 Direct Import Process
         
         ### Step 1: Import Lots Table
         1. Go to Supabase → Table Editor → `lots` table
@@ -496,33 +473,26 @@ FROM processing_records;
         2. Click "Insert" → "Import data from CSV"
         3. Upload `processing_records.csv`
         4. Settings: ✅ First row contains headers, ✅ Auto-detect data types
-        5. **Note:** lot_id column will be empty initially - this is expected!
         
-        ### Step 3: Run SQL Update Query
-        1. Go to Supabase → SQL Editor
-        2. Copy and paste the SQL query shown above
-        3. Click "Run" to execute the query
-        4. Verify that all processing records now have lot_id values
+        ## ✅ What's Changed
+        - ✅ **lot_id is now automatically populated** in processing_records.csv
+        - ✅ **No manual SQL queries needed**
+        - ✅ **Direct import ready** - no foreign key errors
+        - ✅ **Automatic lot matching** based on lot_number
         
-        ## ✅ Benefits of This Approach
-        - ❌ **No foreign key constraint errors** during import
-        - ✅ **Independent imports** - order doesn't matter  
-        - ✅ **Automatic lot_id matching** via SQL
-        - ✅ **Data integrity verification** built-in
-        - ✅ **Optional cleanup** of temporary lot_number column
-        
-        ## 🔍 Verification Queries
+        ## 🔍 Verification After Import
         ```sql
-        -- Check for unmatched lot_numbers
-        SELECT DISTINCT pr.lot_number 
-        FROM processing_records pr 
-        LEFT JOIN lots l ON pr.lot_number = l.lot_number 
-        WHERE l.lot_number IS NULL;
+        -- Check that lot_ids are populated
+        SELECT 
+            COUNT(*) as total_records,
+            COUNT(lot_id) as records_with_lot_id
+        FROM processing_records;
         
-        -- Count records by stage
-        SELECT stage, COUNT(*) 
-        FROM processing_records 
-        GROUP BY stage;
+        -- View sample joined data
+        SELECT l.lot_number, pr.stage, pr.process_date 
+        FROM lots l
+        JOIN processing_records pr ON l.lot_id = pr.lot_id
+        LIMIT 10;
         ```
         """)
 
