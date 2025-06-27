@@ -167,13 +167,15 @@ class ExcelToCSVProcessor:
                     received_pieces = self.normalize_integer(row.iloc[5] if len(row) > 5 else None)  # REC.P
                     received_weight = self.normalize_numeric(row.iloc[6] if len(row) > 6 else 0, 0)  # REC.W
                 
-                # Add lot and get lot_id
+                # Add lot and get lot_id (for internal tracking)
                 lot_id = self.add_lot(lot_number, lot_weight)
                 
-                # Create processing record
+                # Create processing record with BOTH lot_number and lot_id
+                # lot_id will be NULL initially, lot_number will be used for matching
                 processing_record = {
                     'record_id': str(uuid.uuid4()),
-                    'lot_id': lot_id,
+                    'lot_id': None,  # Will be updated via SQL after import
+                    'lot_number': lot_number,  # Include lot_number for SQL matching
                     'stage': stage,
                     'process_date': process_date,
                     'given_pieces': given_pieces,
@@ -200,26 +202,26 @@ class ExcelToCSVProcessor:
         """Validate that all processing records have corresponding lots"""
         st.info("🔍 Validating data integrity...")
         
-        # Get all lot_ids from lots
-        lot_ids_in_lots = set(lot['lot_id'] for lot in self.results['lots_data'])
+        # Get all lot_numbers from lots
+        lot_numbers_in_lots = set(lot['lot_number'] for lot in self.results['lots_data'])
         
-        # Get all lot_ids from processing records
-        lot_ids_in_processing = set(record['lot_id'] for record in self.results['processing_records_data'])
+        # Get all lot_numbers from processing records
+        lot_numbers_in_processing = set(record['lot_number'] for record in self.results['processing_records_data'])
         
         # Find orphaned processing records
-        orphaned_lot_ids = lot_ids_in_processing - lot_ids_in_lots
+        orphaned_lot_numbers = lot_numbers_in_processing - lot_numbers_in_lots
         
-        if orphaned_lot_ids:
+        if orphaned_lot_numbers:
             self.results['validation_issues'].append(
-                f"Found {len(orphaned_lot_ids)} processing records with lot_ids not in lots table: {list(orphaned_lot_ids)[:5]}..."
+                f"Found {len(orphaned_lot_numbers)} processing records with lot_numbers not in lots table: {list(orphaned_lot_numbers)[:5]}..."
             )
             return False
         
         # Find unused lots
-        unused_lot_ids = lot_ids_in_lots - lot_ids_in_processing
-        if unused_lot_ids:
+        unused_lot_numbers = lot_numbers_in_lots - lot_numbers_in_processing
+        if unused_lot_numbers:
             self.results['validation_issues'].append(
-                f"Found {len(unused_lot_ids)} lots with no processing records"
+                f"Found {len(unused_lot_numbers)} lots with no processing records"
             )
         
         st.success("✅ Data integrity validation passed!")
@@ -281,7 +283,7 @@ class ExcelToCSVProcessor:
             lots_df = lots_df.sort_values('lot_number')
             csv_files['lots.csv'] = lots_df.to_csv(index=False, float_format='%.4f')
         
-        # Generate processing records CSV
+        # Generate processing records CSV (with lot_number column for SQL matching)
         if self.results['processing_records_data']:
             processing_df = pd.DataFrame(self.results['processing_records_data'])
             
@@ -296,6 +298,14 @@ class ExcelToCSVProcessor:
             processing_df['received_pieces'] = processing_df['received_pieces'].apply(
                 lambda x: '' if pd.isna(x) or x is None else int(x)
             )
+            
+            # Set lot_id to empty string for CSV (will be filled by SQL)
+            processing_df['lot_id'] = ''
+            
+            # Reorder columns to put lot_number after lot_id for clarity
+            column_order = ['record_id', 'lot_id', 'lot_number', 'stage', 'process_date', 
+                          'given_pieces', 'given_weight', 'received_pieces', 'received_weight']
+            processing_df = processing_df[column_order]
             
             # Sort by process_date and stage for better organization
             processing_df = processing_df.sort_values(['process_date', 'stage'])
@@ -359,17 +369,16 @@ def main():
             if csv_files:
                 st.header("📥 Download CSV Files")
                 
-                # Add prominent import order warning
-                st.error("""
-                🚨 **CRITICAL: Import Order Matters!**
+                # Updated import instructions
+                st.success("""
+                ✅ **NEW APPROACH: No Foreign Key Errors!**
                 
-                **Step 1:** Download and import `lots.csv` FIRST into Supabase
-                **Step 2:** Only then import `processing_records.csv` 
-                
-                Importing in wrong order will cause foreign key constraint errors!
+                **Step 1:** Import `lots.csv` into Supabase  
+                **Step 2:** Import `processing_records.csv` into Supabase  
+                **Step 3:** Run the SQL update query (provided below)
                 """)
                 
-                st.markdown("Download the generated CSV files to import into Supabase:")
+                st.markdown("Download the generated CSV files:")
                 
                 # Create download buttons for individual files
                 col1, col2 = st.columns(2)
@@ -377,7 +386,7 @@ def main():
                 with col1:
                     if 'lots.csv' in csv_files:
                         st.download_button(
-                            label="🥇 Step 1: Download Lots CSV (Import FIRST)",
+                            label="📊 Download Lots CSV",
                             data=csv_files['lots.csv'],
                             file_name='lots.csv',
                             mime='text/csv',
@@ -398,11 +407,11 @@ def main():
                 with col2:
                     if 'processing_records.csv' in csv_files:
                         st.download_button(
-                            label="🥈 Step 2: Download All Processing Records CSV (Import SECOND)",
+                            label="📋 Download Processing Records CSV",
                             data=csv_files['processing_records.csv'],
                             file_name='processing_records.csv',
                             mime='text/csv',
-                            type="secondary"
+                            type="primary"
                         )
                 
                 # Create zip file with all CSVs
@@ -447,41 +456,74 @@ def main():
                     else:
                         st.info("No processing records data generated")
         
-        # Enhanced instructions for Supabase import
-        st.header("📚 Supabase Import Instructions")
+        # SQL Update Instructions
+        st.header("🛠️ SQL Update Query")
         st.markdown("""
-        ## 🚨 Critical Import Steps (Follow Exactly!)
+        **After importing both CSV files to Supabase, run this SQL query in the SQL Editor:**
+        """)
         
-        ### Step 1: Import Lots Table FIRST
+        sql_query = """-- Update lot_id in processing_records table based on lot_number
+UPDATE processing_records 
+SET lot_id = lots.lot_id 
+FROM lots 
+WHERE processing_records.lot_number = lots.lot_number;
+
+-- Verify the update worked
+SELECT 
+    COUNT(*) as total_records,
+    COUNT(lot_id) as records_with_lot_id,
+    COUNT(*) - COUNT(lot_id) as records_without_lot_id
+FROM processing_records;
+
+-- Optional: Remove lot_number column after successful update
+-- ALTER TABLE processing_records DROP COLUMN lot_number;"""
+        
+        st.code(sql_query, language='sql')
+        
+        # Enhanced instructions
+        st.header("📚 Complete Import Instructions")
+        st.markdown("""
+        ## 🚀 Step-by-Step Process
+        
+        ### Step 1: Import Lots Table
         1. Go to Supabase → Table Editor → `lots` table
         2. Click "Insert" → "Import data from CSV"
         3. Upload `lots.csv`
         4. Settings: ✅ First row contains headers, ✅ Auto-detect data types
-        5. **Wait for completion** before proceeding
         
-        ### Step 2: Import Processing Records SECOND
-        1. Go to Supabase → Table Editor → `processing_records` table
-        2. Click "Insert" → "Import data from CSV"  
+        ### Step 2: Import Processing Records Table
+        1. Go to Supabase → Table Editor → `processing_records` table  
+        2. Click "Insert" → "Import data from CSV"
         3. Upload `processing_records.csv`
         4. Settings: ✅ First row contains headers, ✅ Auto-detect data types
+        5. **Note:** lot_id column will be empty initially - this is expected!
         
-        ## ⚠️ Troubleshooting Foreign Key Errors
+        ### Step 3: Run SQL Update Query
+        1. Go to Supabase → SQL Editor
+        2. Copy and paste the SQL query shown above
+        3. Click "Run" to execute the query
+        4. Verify that all processing records now have lot_id values
         
-        **If you get the foreign key constraint error:**
-        1. **Clear both tables** in Supabase (Delete all rows)
-        2. **Re-download** the CSV files from this tool
-        3. **Import lots.csv FIRST**, wait for completion
-        4. **Then import processing_records.csv**
+        ## ✅ Benefits of This Approach
+        - ❌ **No foreign key constraint errors** during import
+        - ✅ **Independent imports** - order doesn't matter  
+        - ✅ **Automatic lot_id matching** via SQL
+        - ✅ **Data integrity verification** built-in
+        - ✅ **Optional cleanup** of temporary lot_number column
         
-        **Alternative Approach:**
-        - Import individual stage CSV files instead of the combined processing_records.csv
-        - This can help isolate any problematic records
+        ## 🔍 Verification Queries
+        ```sql
+        -- Check for unmatched lot_numbers
+        SELECT DISTINCT pr.lot_number 
+        FROM processing_records pr 
+        LEFT JOIN lots l ON pr.lot_number = l.lot_number 
+        WHERE l.lot_number IS NULL;
         
-        ## 📋 Data Validation Checks
-        - ✅ All processing records have valid lot_id references
-        - ✅ No orphaned records
-        - ✅ Data types are properly formatted
-        - ✅ Dates are in YYYY-MM-DD format
+        -- Count records by stage
+        SELECT stage, COUNT(*) 
+        FROM processing_records 
+        GROUP BY stage;
+        ```
         """)
 
 if __name__ == "__main__":
