@@ -180,6 +180,7 @@ class ExcelToCSVProcessor:
                 processing_record = {
                     'record_id': str(uuid.uuid4()),
                     'lot_id': lot_id,  # This is now populated with actual UUID
+                    'lot_number': lot_number,  # Keep lot_number for verification
                     'stage': stage,
                     'process_date': process_date,
                     'given_pieces': given_pieces,
@@ -304,7 +305,7 @@ class ExcelToCSVProcessor:
             )
             
             # Column order for processing records (lot_id is now populated!)
-            column_order = ['record_id', 'lot_id', 'stage', 'process_date', 
+            column_order = ['record_id', 'lot_id', 'lot_number', 'stage', 'process_date', 
                           'given_pieces', 'given_weight', 'received_pieces', 'received_weight']
             processing_df = processing_df[column_order]
             
@@ -376,7 +377,7 @@ def main():
                 
                 **Step 1:** Import `lots.csv` into Supabase  
                 **Step 2:** Import `processing_records.csv` into Supabase  
-                **That's it!** - lot_id values are automatically populated!
+                **That's it!** - lot_id values are automatically populated and lot_number is included for verification!
                 """)
                 
                 st.markdown("Download the generated CSV files:")
@@ -474,25 +475,34 @@ def main():
         3. Upload `processing_records.csv`
         4. Settings: ✅ First row contains headers, ✅ Auto-detect data types
         
-        ## ✅ What's Changed
-        - ✅ **lot_id is now automatically populated** in processing_records.csv
+        ## ✅ What's Included Now
+        - ✅ **lot_id is automatically populated** in processing_records.csv
+        - ✅ **lot_number is included** for easy verification
         - ✅ **No manual SQL queries needed**
         - ✅ **Direct import ready** - no foreign key errors
         - ✅ **Automatic lot matching** based on lot_number
         
         ## 🔍 Verification After Import
         ```sql
-        -- Check that lot_ids are populated
+        -- Check that lot_ids are populated and match lot_numbers
         SELECT 
-            COUNT(*) as total_records,
-            COUNT(lot_id) as records_with_lot_id
-        FROM processing_records;
+            pr.lot_number,
+            pr.lot_id,
+            l.lot_number as lots_table_lot_number,
+            pr.stage,
+            pr.process_date
+        FROM processing_records pr
+        LEFT JOIN lots l ON pr.lot_id = l.lot_id
+        ORDER BY pr.lot_number, pr.process_date
+        LIMIT 20;
         
-        -- View sample joined data
-        SELECT l.lot_number, pr.stage, pr.process_date 
-        FROM lots l
-        JOIN processing_records pr ON l.lot_id = pr.lot_id
-        LIMIT 10;
+        -- Count records with proper lot_id matching
+        SELECT 
+            COUNT(*) as total_processing_records,
+            COUNT(l.lot_id) as records_with_matching_lots,
+            COUNT(*) - COUNT(l.lot_id) as orphaned_records
+        FROM processing_records pr
+        LEFT JOIN lots l ON pr.lot_id = l.lot_id;
         ```
         """)
 
