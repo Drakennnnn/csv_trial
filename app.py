@@ -87,16 +87,23 @@ class ExcelToCSVProcessor:
         if pd.isna(value) or value == "" or value is None:
             return default
         try:
-            return float(value)
+            # Convert to float first, then ensure it's a clean number
+            num_val = float(value)
+            # Remove unnecessary decimal places for whole numbers
+            if num_val.is_integer():
+                return int(num_val)
+            return round(num_val, 4)  # Round to 4 decimal places
         except:
             return default
 
     def normalize_integer(self, value, default=None):
-        """Normalize integer values"""
+        """Normalize integer values - removes decimals properly"""
         if pd.isna(value) or value == "" or value is None:
             return default
         try:
-            return int(float(value))
+            # Convert to float first to handle "486.0" format, then to int
+            float_val = float(value)
+            return int(float_val)
         except:
             return default
 
@@ -233,17 +240,33 @@ class ExcelToCSVProcessor:
         # Generate lots CSV
         if self.results['lots_data']:
             lots_df = pd.DataFrame(self.results['lots_data'])
-            csv_files['lots.csv'] = lots_df.to_csv(index=False)
+            # Ensure proper data types for lots
+            lots_df['lot_weight'] = lots_df['lot_weight'].astype(float)
+            # Format to avoid .0 issues
+            csv_files['lots.csv'] = lots_df.to_csv(index=False, float_format='%.4f')
         
         # Generate processing records CSV
         if self.results['processing_records_data']:
             processing_df = pd.DataFrame(self.results['processing_records_data'])
-            csv_files['processing_records.csv'] = processing_df.to_csv(index=False)
+            
+            # Ensure proper data types for processing records
+            processing_df['given_weight'] = processing_df['given_weight'].astype(float)
+            processing_df['received_weight'] = processing_df['received_weight'].astype(float)
+            
+            # Handle integer columns properly - convert None to empty string for CSV
+            processing_df['given_pieces'] = processing_df['given_pieces'].apply(
+                lambda x: '' if pd.isna(x) or x is None else int(x)
+            )
+            processing_df['received_pieces'] = processing_df['received_pieces'].apply(
+                lambda x: '' if pd.isna(x) or x is None else int(x)
+            )
+            
+            csv_files['processing_records.csv'] = processing_df.to_csv(index=False, float_format='%.4f')
             
             # Also generate separate CSV for each stage
             for stage in self.results['sheets_processed']:
-                stage_df = processing_df[processing_df['stage'] == stage]
-                csv_files[f'{stage.lower()}_records.csv'] = stage_df.to_csv(index=False)
+                stage_df = processing_df[processing_df['stage'] == stage].copy()
+                csv_files[f'{stage.lower()}_records.csv'] = stage_df.to_csv(index=False, float_format='%.4f')
         
         return csv_files
 
