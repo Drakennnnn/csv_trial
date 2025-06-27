@@ -32,6 +32,10 @@ class ExcelToCSVProcessor:
         
         # Track unique lots - lot_number -> lot_data mapping
         self.unique_lots = {}
+        
+        # Generated CSVs storage
+        self.generated_lots_csv = None
+        self.generated_lots_df = None
 
     def normalize_date(self, date_value):
         """Normalize different date formats to YYYY-MM-DD"""
@@ -133,8 +137,8 @@ class ExcelToCSVProcessor:
                 error_msg = f"Error collecting lot from row {index + 2}: {str(e)}"
                 self.results['errors'].append(error_msg)
 
-    def process_sheet(self, df, stage):
-        """Process individual sheet data"""
+    def process_sheet_for_records(self, df, stage):
+        """Process individual sheet data for processing records"""
         st.info(f"Processing {stage} sheet with {len(df)} rows")
         
         processed_count = 0
@@ -161,7 +165,7 @@ class ExcelToCSVProcessor:
                 # Create processing record with lot_number (lot_id will be filled later)
                 processing_record = {
                     'record_id': str(uuid.uuid4()),
-                    'lot_id': None,  # Will be filled later by matching lot_number
+                    'lot_id': None,  # Will be filled later by matching lot_number from lots.csv
                     'lot_number': lot_number,  # Keep for matching
                     'stage': stage,
                     'process_date': process_date,
@@ -185,29 +189,63 @@ class ExcelToCSVProcessor:
         
         self.results['sheets_processed'].append(stage)
 
-    def process_excel_file(self, uploaded_file):
-        """Main method to process the entire Excel file"""
-        st.info("Starting Excel processing...")
+    def process_excel_file_for_lots(self, uploaded_file):
+        """STEP 1: Process Excel file and generate ONLY lots.csv"""
+        st.info("🔍 STEP 1: Processing Excel file to generate lots.csv...")
         
         try:
             # Read all sheets
             excel_file = pd.ExcelFile(uploaded_file)
             st.info(f"Found sheets: {excel_file.sheet_names}")
             
-            # STEP 1: First pass - collect all unique lots from all sheets
-            st.info("🔍 Step 1: Collecting unique lots from all sheets...")
+            # Collect all unique lots from all sheets
             for sheet_name, stage in self.sheet_mapping.items():
                 if sheet_name in excel_file.sheet_names:
+                    st.info(f"Scanning {sheet_name} for unique lots...")
                     df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=0)
                     df = df.dropna(how='all')
                     self.collect_unique_lots(df)
+                else:
+                    st.warning(f"Sheet '{sheet_name}' not found in Excel file")
             
             # Generate lots data
             self.results['lots_data'] = list(self.unique_lots.values())
             st.success(f"✅ Found {len(self.unique_lots)} unique lots")
             
-            # STEP 2: Second pass - process each sheet for processing records
-            st.info("📊 Step 2: Processing sheets for processing records...")
+            # Generate lots.csv
+            if self.results['lots_data']:
+                lots_df = pd.DataFrame(self.results['lots_data'])
+                lots_df['lot_weight'] = lots_df['lot_weight'].astype(float)
+                lots_df = lots_df.sort_values('lot_number')
+                
+                # Store the generated CSV and DataFrame
+                self.generated_lots_csv = lots_df.to_csv(index=False, float_format='%.4f')
+                self.generated_lots_df = lots_df.copy()
+                
+                st.success(f"✅ Generated lots.csv with {len(lots_df)} unique lots")
+                return True
+            else:
+                st.error("❌ No lots data found")
+                return False
+            
+        except Exception as e:
+            error_msg = f"Fatal error processing Excel file: {str(e)}"
+            st.error(error_msg)
+            self.results['errors'].append(error_msg)
+            return False
+
+    def process_excel_file_for_records(self, uploaded_file):
+        """STEP 2: Process Excel file for processing records"""
+        st.info("📊 STEP 2: Processing Excel file for processing records...")
+        
+        try:
+            # Clear previous processing records
+            self.results['processing_records_data'] = []
+            self.results['sheets_processed'] = []
+            
+            # Read all sheets and process for records
+            excel_file = pd.ExcelFile(uploaded_file)
+            
             for sheet_name, stage in self.sheet_mapping.items():
                 if sheet_name in excel_file.sheet_names:
                     st.subheader(f"Processing {sheet_name} → {stage}")
@@ -219,85 +257,98 @@ class ExcelToCSVProcessor:
                     with st.expander(f"Preview {sheet_name} data"):
                         st.dataframe(df.head())
                     
-                    self.process_sheet(df, stage)
+                    self.process_sheet_for_records(df, stage)
                 else:
                     st.warning(f"Sheet '{sheet_name}' not found in Excel file")
             
-            st.success("✅ Processing completed successfully!")
+            st.success("✅ Processing records data collected successfully!")
             return True
             
         except Exception as e:
-            error_msg = f"Fatal error processing Excel file: {str(e)}"
+            error_msg = f"Fatal error processing Excel file for records: {str(e)}"
             st.error(error_msg)
             self.results['errors'].append(error_msg)
             return False
 
-    def generate_csv_files(self):
-        """Generate CSV files for download"""
-        csv_files = {}
+    def generate_processing_records_csv(self):
+        """Generate processing_records.csv using exact lot_ids from generated lots.csv"""
+        if not self.generated_lots_df is not None:
+            st.error("❌ Please generate lots.csv first!")
+            return None
         
-        # STEP 1: Generate lots.csv FIRST
-        if self.results['lots_data']:
-            lots_df = pd.DataFrame(self.results['lots_data'])
-            lots_df['lot_weight'] = lots_df['lot_weight'].astype(float)
-            lots_df = lots_df.sort_values('lot_number')
-            csv_files['lots.csv'] = lots_df.to_csv(index=False, float_format='%.4f')
-            st.success(f"✅ Generated lots.csv with {len(lots_df)} unique lots")
+        if not self.results['processing_records_data']:
+            st.error("❌ No processing records data found!")
+            return None
         
-        # STEP 2: Generate processing_records.csv with lot_id matching
-        if self.results['processing_records_data']:
-            processing_df = pd.DataFrame(self.results['processing_records_data'])
-            
-            # CRITICAL: Match lot_number and fill lot_id from unique_lots
-            matched_count = 0
-            unmatched_count = 0
-            
-            for idx, row in processing_df.iterrows():
-                lot_number = row['lot_number']
-                
-                if lot_number in self.unique_lots:
-                    # Use the SAME lot_id from lots data
-                    processing_df.at[idx, 'lot_id'] = self.unique_lots[lot_number]['lot_id']
-                    matched_count += 1
-                else:
-                    st.error(f"❌ ERROR: Could not find lot_id for lot_number: {lot_number}")
-                    unmatched_count += 1
-            
-            st.success(f"✅ Matched {matched_count} processing records with lot_ids")
-            if unmatched_count > 0:
-                st.error(f"❌ {unmatched_count} processing records could not be matched")
-            
-            # Format columns properly
-            processing_df['given_weight'] = processing_df['given_weight'].astype(float)
-            processing_df['received_weight'] = processing_df['received_weight'].astype(float)
-            
-            # Handle integer columns
-            processing_df['given_pieces'] = processing_df['given_pieces'].apply(
-                lambda x: '' if pd.isna(x) or x is None else int(x)
-            )
-            processing_df['received_pieces'] = processing_df['received_pieces'].apply(
-                lambda x: '' if pd.isna(x) or x is None else int(x)
-            )
-            
-            # Column order
-            column_order = ['record_id', 'lot_id', 'lot_number', 'stage', 'process_date', 
-                          'given_pieces', 'given_weight', 'received_pieces', 'received_weight']
-            processing_df = processing_df[column_order]
-            
-            # Sort by process_date and stage
-            processing_df = processing_df.sort_values(['process_date', 'stage'])
-            csv_files['processing_records.csv'] = processing_df.to_csv(index=False, float_format='%.4f')
-            
-            # Generate separate CSV for each stage
-            for stage in self.results['sheets_processed']:
-                stage_df = processing_df[processing_df['stage'] == stage].copy()
-                csv_files[f'{stage.lower()}_records.csv'] = stage_df.to_csv(index=False, float_format='%.4f')
+        st.info("🔗 Matching lot_numbers with lot_ids from lots.csv...")
         
-        return csv_files
+        # Create processing DataFrame
+        processing_df = pd.DataFrame(self.results['processing_records_data'])
+        
+        # Create lot_number to lot_id mapping from the GENERATED lots.csv
+        lot_mapping = {}
+        for _, row in self.generated_lots_df.iterrows():
+            lot_mapping[row['lot_number']] = row['lot_id']
+        
+        st.info(f"Available lot_ids in lots.csv: {len(lot_mapping)}")
+        
+        # Match lot_numbers and fill lot_ids
+        matched_count = 0
+        unmatched_count = 0
+        unmatched_lots = []
+        
+        for idx, row in processing_df.iterrows():
+            lot_number = row['lot_number']
+            
+            if lot_number in lot_mapping:
+                # Use the EXACT lot_id from lots.csv
+                processing_df.at[idx, 'lot_id'] = lot_mapping[lot_number]
+                matched_count += 1
+            else:
+                st.error(f"❌ ERROR: lot_number '{lot_number}' not found in lots.csv")
+                unmatched_lots.append(lot_number)
+                unmatched_count += 1
+        
+        if unmatched_count > 0:
+            st.error(f"❌ {unmatched_count} processing records could not be matched")
+            st.error(f"Unmatched lot_numbers: {unmatched_lots}")
+            return None
+        
+        st.success(f"✅ Successfully matched {matched_count} processing records with lot_ids from lots.csv")
+        
+        # Format columns properly
+        processing_df['given_weight'] = processing_df['given_weight'].astype(float)
+        processing_df['received_weight'] = processing_df['received_weight'].astype(float)
+        
+        # Handle integer columns
+        processing_df['given_pieces'] = processing_df['given_pieces'].apply(
+            lambda x: '' if pd.isna(x) or x is None else int(x)
+        )
+        processing_df['received_pieces'] = processing_df['received_pieces'].apply(
+            lambda x: '' if pd.isna(x) or x is None else int(x)
+        )
+        
+        # Column order
+        column_order = ['record_id', 'lot_id', 'lot_number', 'stage', 'process_date', 
+                      'given_pieces', 'given_weight', 'received_pieces', 'received_weight']
+        processing_df = processing_df[column_order]
+        
+        # Sort by process_date and stage
+        processing_df = processing_df.sort_values(['process_date', 'stage'])
+        
+        return processing_df.to_csv(index=False, float_format='%.4f')
+
+# Initialize session state
+if 'processor' not in st.session_state:
+    st.session_state.processor = ExcelToCSVProcessor()
+if 'lots_generated' not in st.session_state:
+    st.session_state.lots_generated = False
+if 'uploaded_file' not in st.session_state:
+    st.session_state.uploaded_file = None
 
 def main():
     st.title("💎 Emerald Inventory - Excel to CSV Converter")
-    st.markdown("Upload your Excel file to convert it into CSV files for direct Supabase import")
+    st.markdown("**Step-by-step approach:** Generate lots.csv first, then processing_records.csv with exact lot_id matching")
     
     # File uploader
     uploaded_file = st.file_uploader(
@@ -307,168 +358,147 @@ def main():
     )
     
     if uploaded_file is not None:
-        # Show file details
+        st.session_state.uploaded_file = uploaded_file
         st.info(f"📄 File: {uploaded_file.name} ({uploaded_file.size} bytes)")
         
-        # Initialize processor
-        processor = ExcelToCSVProcessor()
+        # STEP 1: Generate lots.csv
+        st.header("🚀 STEP 1: Generate Lots CSV")
         
-        # Process the file
-        if processor.process_excel_file(uploaded_file):
-            # Show results summary
-            st.header("📊 Processing Results")
+        if st.button("📊 Generate Lots CSV", type="primary"):
+            st.session_state.processor = ExcelToCSVProcessor()  # Reset processor
             
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Unique Lots", len(processor.results['lots_data']))
-            with col2:
-                st.metric("Processing Records", len(processor.results['processing_records_data']))
-            with col3:
-                st.metric("Sheets Processed", len(processor.results['sheets_processed']))
+            if st.session_state.processor.process_excel_file_for_lots(uploaded_file):
+                st.session_state.lots_generated = True
+                st.success("✅ Lots CSV generated successfully!")
+            else:
+                st.error("❌ Failed to generate lots CSV")
+                st.session_state.lots_generated = False
+        
+        # Show lots.csv download if generated
+        if st.session_state.lots_generated and st.session_state.processor.generated_lots_csv:
+            st.subheader("📥 Download Lots CSV")
             
-            # Show errors if any
-            if processor.results['errors']:
-                st.warning(f"⚠️ {len(processor.results['errors'])} errors encountered:")
-                with st.expander("View Errors"):
-                    for error in processor.results['errors']:
-                        st.text(f"• {error}")
+            # Show lots preview
+            with st.expander("👀 Preview Lots Data"):
+                st.dataframe(st.session_state.processor.generated_lots_df, use_container_width=True)
+                st.info(f"Total unique lots: {len(st.session_state.processor.generated_lots_df)}")
             
-            # Generate CSV files
-            csv_files = processor.generate_csv_files()
+            st.download_button(
+                label="📊 Download lots.csv",
+                data=st.session_state.processor.generated_lots_csv,
+                file_name='lots.csv',
+                mime='text/csv',
+                type="primary"
+            )
             
-            if csv_files:
-                st.header("📥 Download CSV Files")
-                
-                st.success("""
-                ✅ **PERFECT MATCHING IMPLEMENTED!**
-                
-                **How it works:**
-                1. 🔍 **Step 1:** Scanned all sheets and collected unique lots with generated lot_id
-                2. 📊 **Step 2:** Generated lots.csv with lot_id for each lot_number  
-                3. 🔗 **Step 3:** Generated processing_records.csv and matched lot_number to use SAME lot_id from lots.csv
-                4. ✅ **Result:** Both CSVs have matching lot_id for same lot_number - NO random IDs!
-                """)
-                
-                st.markdown("Download the generated CSV files:")
-                
-                # Create download buttons
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    if 'lots.csv' in csv_files:
-                        st.download_button(
-                            label="📊 Download Lots CSV",
-                            data=csv_files['lots.csv'],
-                            file_name='lots.csv',
-                            mime='text/csv',
-                            type="primary"
-                        )
+            st.success("✅ **lots.csv is ready!** Now generate processing_records.csv below.")
+            
+            # STEP 2: Generate processing_records.csv
+            st.header("🚀 STEP 2: Generate Processing Records CSV")
+            st.info("This will use the exact lot_ids from the lots.csv generated above")
+            
+            if st.button("📋 Generate Processing Records CSV", type="secondary"):
+                if st.session_state.processor.process_excel_file_for_records(uploaded_file):
+                    # Generate processing records CSV with exact lot_id matching
+                    processing_csv = st.session_state.processor.generate_processing_records_csv()
                     
-                    # Individual stage files
-                    for stage in processor.results['sheets_processed']:
-                        filename = f'{stage.lower()}_records.csv'
-                        if filename in csv_files:
-                            st.download_button(
-                                label=f"📊 Download {stage} Records CSV",
-                                data=csv_files[filename],
-                                file_name=filename,
-                                mime='text/csv'
-                            )
-                
-                with col2:
-                    if 'processing_records.csv' in csv_files:
+                    if processing_csv:
+                        st.success("✅ Processing records CSV generated successfully!")
+                        
+                        # Show processing records preview
+                        processing_df = pd.DataFrame(st.session_state.processor.results['processing_records_data'])
+                        
+                        with st.expander("👀 Preview Processing Records Data"):
+                            st.dataframe(processing_df, use_container_width=True)
+                            st.info(f"Total processing records: {len(processing_df)}")
+                            
+                            # Show breakdown by stage
+                            stage_counts = processing_df['stage'].value_counts()
+                            st.subheader("Records by Stage:")
+                            for stage, count in stage_counts.items():
+                                st.text(f"• {stage}: {count} records")
+                        
+                        # Download processing records CSV
                         st.download_button(
-                            label="📋 Download Processing Records CSV",
-                            data=csv_files['processing_records.csv'],
+                            label="📋 Download processing_records.csv",
+                            data=processing_csv,
                             file_name='processing_records.csv',
                             mime='text/csv',
                             type="primary"
                         )
-                
-                # Create zip file with all CSVs
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    for filename, content in csv_files.items():
-                        zip_file.writestr(filename, content)
-                
-                zip_buffer.seek(0)
-                
-                st.download_button(
-                    label="📦 Download All CSV Files (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name='emerald_inventory_csvs.zip',
-                    mime='application/zip'
-                )
-                
-                # Show preview of generated data
-                st.header("👀 Data Preview")
-                
-                tab1, tab2 = st.tabs(["Lots Data", "Processing Records Data"])
-                
-                with tab1:
-                    if processor.results['lots_data']:
-                        lots_df = pd.DataFrame(processor.results['lots_data'])
-                        st.dataframe(lots_df, use_container_width=True)
-                        st.info(f"Total unique lots: {len(lots_df)}")
-                    else:
-                        st.info("No lots data generated")
-                
-                with tab2:
-                    if processor.results['processing_records_data']:
-                        processing_df = pd.DataFrame(processor.results['processing_records_data'])
-                        st.dataframe(processing_df, use_container_width=True)
-                        st.info(f"Total processing records: {len(processing_df)}")
                         
-                        # Show breakdown by stage
-                        stage_counts = processing_df['stage'].value_counts()
-                        st.subheader("Records by Stage:")
-                        for stage, count in stage_counts.items():
-                            st.text(f"• {stage}: {count} records")
+                        # Create zip with both files
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                            zip_file.writestr('lots.csv', st.session_state.processor.generated_lots_csv)
+                            zip_file.writestr('processing_records.csv', processing_csv)
+                        
+                        zip_buffer.seek(0)
+                        
+                        st.download_button(
+                            label="📦 Download Both CSV Files (ZIP)",
+                            data=zip_buffer.getvalue(),
+                            file_name='emerald_inventory_csvs.zip',
+                            mime='application/zip'
+                        )
+                        
+                        st.success("""
+                        ✅ **PERFECT MATCHING COMPLETED!**
+                        
+                        **What happened:**
+                        1. 📊 Generated lots.csv with unique lot_id for each lot_number
+                        2. 📋 Generated processing_records.csv using EXACT same lot_id from lots.csv
+                        3. 🔗 Matched lot_number between both CSVs - NO random lot_ids!
+                        
+                        **Ready for Supabase import:**
+                        - Import lots.csv first
+                        - Then import processing_records.csv
+                        - lot_ids will match perfectly!
+                        """)
                     else:
-                        st.info("No processing records data generated")
+                        st.error("❌ Failed to generate processing records CSV")
+                else:
+                    st.error("❌ Failed to process Excel file for records")
         
-        # Instructions 
-        st.header("📚 Import Instructions")
-        st.markdown("""
-        ## 🚀 Direct Import Process
-        
-        ### Step 1: Import Lots Table
-        1. Go to Supabase → Table Editor → `lots` table
-        2. Click "Insert" → "Import data from CSV"
-        3. Upload `lots.csv`
-        4. ✅ First row contains headers, ✅ Auto-detect data types
-        
-        ### Step 2: Import Processing Records Table
-        1. Go to Supabase → Table Editor → `processing_records` table  
-        2. Click "Insert" → "Import data from CSV"
-        3. Upload `processing_records.csv`
-        4. ✅ First row contains headers, ✅ Auto-detect data types
-        
-        ## ✅ What's Fixed Now
-        - ✅ **Two-pass processing:** First pass collects unique lots, second pass processes records
-        - ✅ **Same lot_id for same lot_number:** No random generation during processing
-        - ✅ **Perfect matching:** processing_records.csv uses exact lot_id from lots.csv
-        - ✅ **lot_number included:** For easy verification and debugging
-        - ✅ **All sheets have same columns:** Simplified processing logic
-        
-        ## 🔍 Verification Query
-        ```sql
-        -- Verify lot_id matching between tables
-        SELECT 
-            pr.lot_number,
-            pr.lot_id,
-            l.lot_number as lots_table_lot_number,
-            CASE 
-                WHEN pr.lot_id = l.lot_id AND pr.lot_number = l.lot_number 
-                THEN '✅ PERFECT MATCH' 
-                ELSE '❌ MISMATCH' 
-            END as match_status
-        FROM processing_records pr
-        LEFT JOIN lots l ON pr.lot_id = l.lot_id
-        ORDER BY pr.lot_number
-        LIMIT 20;
-        ```
-        """)
+        # Show errors if any
+        if st.session_state.processor.results['errors']:
+            st.warning(f"⚠️ {len(st.session_state.processor.results['errors'])} errors encountered:")
+            with st.expander("View Errors"):
+                for error in st.session_state.processor.results['errors']:
+                    st.text(f"• {error}")
+    
+    # Instructions
+    st.header("📚 How This Works")
+    st.markdown("""
+    ## 🎯 **Step-by-Step Approach**
+    
+    ### Why This Method Works:
+    1. **🔍 STEP 1:** Generate lots.csv first with unique lot_id for each lot_number
+    2. **📋 STEP 2:** Generate processing_records.csv and match lot_number to use SAME lot_id from lots.csv
+    3. **✅ Result:** Both CSVs have perfectly matching lot_ids - no randomness!
+    
+    ### 🚀 Supabase Import:
+    1. Import `lots.csv` first
+    2. Import `processing_records.csv` second
+    3. All lot_ids will match perfectly!
+    
+    ### 🔍 Verification Query:
+    ```sql
+    -- Check perfect lot_id matching
+    SELECT 
+        pr.lot_number,
+        pr.lot_id,
+        l.lot_number as lots_table_lot_number,
+        CASE 
+            WHEN pr.lot_id = l.lot_id AND pr.lot_number = l.lot_number 
+            THEN '✅ PERFECT MATCH' 
+            ELSE '❌ MISMATCH' 
+        END as match_status
+    FROM processing_records pr
+    LEFT JOIN lots l ON pr.lot_id = l.lot_id
+    ORDER BY pr.lot_number;
+    ```
+    """)
 
 if __name__ == "__main__":
     main()
